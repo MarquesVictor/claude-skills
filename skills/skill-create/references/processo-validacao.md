@@ -50,13 +50,16 @@ Verificar a organização e a integridade dos arquivos.
 
 ### Validação automatizada
 
-Executar, a partir do diretório da Skill `skill-create`:
+Executar, a partir do diretório da Skill `skill-create`, o comando correspondente à origem da Skill:
 
-    python3 scripts/validar-skill.py <caminho-da-skill-avaliada> [--estrito] [--biblioteca]
+| Skill avaliada | Comando | Critério de aprovação |
+|---|---|---|
+| Criada ou mantida no padrão da biblioteca pessoal (obrigatório) | `python3 scripts/validar-skill.py <caminho-da-skill> --biblioteca --estrito` | `Resultado: APROVADO`, sem erros nem avisos |
+| Externa (terceiros, plugins) | `python3 scripts/validar-skill.py <caminho-da-skill>` | Sem `[ERRO]`; avisos avaliados e relatados |
 
 Opções:
 
-- `--estrito`: trata avisos como erros.
+- `--estrito`: trata avisos como erros. Obrigatório no padrão da biblioteca. Se um aviso for legítimo e não puder ser eliminado, registrar a validação como Reprovado, com a justificativa, e pedir decisão ao usuário.
 - `--biblioteca`: aplica o padrão da biblioteca pessoal e exige `examples/como-usar.md`. Usar em toda Skill criada pela `skill-create` e em Skills da biblioteca mantidas por ela. Não usar para avaliar Skills de terceiros ou de plugins, para as quais só o `SKILL.md` é obrigatório.
 
 O script verifica: existência do `SKILL.md`; frontmatter na primeira linha (sem linha em branco ou BOM antes); fechamento do frontmatter; presença e tamanho da `description`; formato do `name`; propriedades desconhecidas; tamanho do `SKILL.md`; existência dos arquivos referenciados em `references/`, `scripts/`, `assets/` e `evals/`; arquivos e diretórios vazios; padrões de comandos perigosos (somente sinalizados para revisão manual); e o guia `examples/como-usar.md`.

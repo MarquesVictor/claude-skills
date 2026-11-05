@@ -40,7 +40,7 @@ Identificar o modo pela solicitação. Se não for possível, perguntar.
 7. Definir a arquitetura mais simples que atenda.
 8. Apresentar o planejamento quando houver decisões importantes.
 9. Implementar quando autorizado, incluindo o guia `examples/como-usar.md` (ver "Guia de uso").
-10. Executar as validações disponíveis, começando por `scripts/validar-skill.py`.
+10. Executar as validações disponíveis, começando por `scripts/validar-skill.py` (com `--biblioteca --estrito` no padrão da biblioteca).
 11. Apresentar os resultados.
 
 ## Princípios
@@ -106,7 +106,9 @@ Seções e modelo: `references/padroes-qualidade.md` §6.
 
 Executar validações proporcionais à complexidade e ao risco da Skill:
 
-1. **Estrutural (sempre):** `python3 scripts/validar-skill.py <caminho-da-skill>`, com o caminho relativo ao diretório desta Skill. Para Skills criadas ou mantidas no padrão da biblioteca, acrescentar `--biblioteca`, que exige `examples/como-usar.md` com as seções mínimas. Corrigir todo `[ERRO]` e avaliar cada `[AVISO]`.
+1. **Estrutural (sempre):** executar o script com o caminho relativo ao diretório desta Skill.
+   - **Padrão da biblioteca (obrigatório)** para toda Skill criada ou mantida por esta Skill: `python3 scripts/validar-skill.py <caminho-da-skill> --biblioteca --estrito`. `--biblioteca` exige `examples/como-usar.md` com as seções mínimas e `--estrito` trata avisos como erros. A Skill só é considerada válida com `Resultado: APROVADO`. Se um aviso for legítimo e não puder ser eliminado, não declarar a validação aprovada: informar o aviso, a justificativa e pedir decisão ao usuário.
+   - **Skills externas** (terceiros, plugins, fora do padrão da biblioteca): `python3 scripts/validar-skill.py <caminho-da-skill>`, sem `--biblioteca`. Corrigir ou relatar todo `[ERRO]` e avaliar cada `[AVISO]`.
 2. **Semântica:** objetivo, coerência, instruções executáveis, ausência de contradições, limites, entradas e saídas, tratamento de erros, idioma.
 3. **Acionamento e comportamento:** cenários de acionamento direto, indireto, não acionamento, pedido ambíguo e falha. A versão completa tem pelo menos 5 cenários; Skills simples e sem risco podem usar a versão reduzida descrita na referência.
 4. **Segurança:** permissões, comandos perigosos, perda de dados, credenciais, alterações não autorizadas, dependências externas.
@@ -149,7 +151,7 @@ Para Skills simples, condensar as seções em poucos itens, sem omitir validaç�
 
 ## Critérios de conclusão
 
-Uma Skill está concluída quando: o objetivo está definido; o escopo está delimitado; o acionamento está adequado; a estrutura é válida (script sem `[ERRO]`); as instruções são consistentes; os arquivos necessários existem, incluindo `examples/como-usar.md` no padrão da biblioteca; as dependências estão documentadas; os riscos foram avaliados; as validações aplicáveis foram realizadas; as limitações estão documentadas; e o usuário sabe como utilizá-la.
+Uma Skill está concluída quando: o objetivo está definido; o escopo está delimitado; o acionamento está adequado; a estrutura é válida (no padrão da biblioteca, `--biblioteca --estrito` com `Resultado: APROVADO`; em Skills externas, script sem `[ERRO]`); as instruções são consistentes; os arquivos necessários existem, incluindo `examples/como-usar.md` no padrão da biblioteca; as dependências estão documentadas; os riscos foram avaliados; as validações aplicáveis foram realizadas; as limitações estão documentadas; e o usuário sabe como utilizá-la.
 
 Se algum critério não for atendido, informar o que está pendente.
 

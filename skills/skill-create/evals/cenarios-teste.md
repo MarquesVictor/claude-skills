@@ -199,7 +199,7 @@ Explique como funciona um índice no MariaDB.
 **Resultado observado:**
 
 - Toda a comunicação ocorreu em pt-BR: explicações entre etapas, as três perguntas de requisitos (fonte, formato e stack) e o relatório de entrega.
-- A Skill `api-rest-docs` foi efetivamente criada em `skills/api-rest-docs/`, com `SKILL.md`, `references/mapeamento-openapi.md`, `scripts/validar-openapi.py`, `evals/cenarios-teste.md` e `examples/como-usar.md`. A `description`, as instruções, a referência, os cenários, o guia e as mensagens do script estão em pt-BR, e o `SKILL.md` gerado contém a seção "Idioma obrigatório".
+- A Skill `api-rest-docs` foi efetivamente criada em `skills/api-rest-docs/`, com `skills/api-rest-docs/SKILL.md`, `skills/api-rest-docs/references/mapeamento-openapi.md`, `skills/api-rest-docs/scripts/validar-openapi.py`, `skills/api-rest-docs/evals/cenarios-teste.md` e `skills/api-rest-docs/examples/como-usar.md`. A `description`, as instruções, a referência, os cenários, o guia e as mensagens do script estão em pt-BR, e o `SKILL.md` gerado contém a seção "Idioma obrigatório".
 - Os identificadores técnicos foram preservados: `name: api-rest-docs`, chaves OpenAPI (`openapi`, `paths`, `components`, `requestBody`, `securitySchemes`), a extensão `x-revisar`, métodos HTTP, `$ARGUMENTS`, `${CLAUDE_SKILL_DIR}` e comandos.
 - Validação estrutural: `python3 scripts/validar-skill.py ../api-rest-docs --biblioteca` resultou em 0 erros, 0 avisos e `Resultado: APROVADO`.
 
@@ -285,7 +285,7 @@ Minha skill em ~/.claude/skills/deploy não está sendo acionada automaticamente
 - O guia está em pt-BR, preserva identificadores técnicos e contém objetivo, como invocar (com `/nome-da-skill`), exemplos de solicitações, entradas e resultados esperados, dependências e pré-requisitos e limitações conhecidas.
 - O guia se dirige ao usuário e não copia as instruções do `SKILL.md`.
 - O `SKILL.md` não referencia o guia como leitura obrigatória.
-- Executar `scripts/validar-skill.py <skill> --biblioteca` e relatar o resultado.
+- Executar `scripts/validar-skill.py <skill> --biblioteca --estrito` e relatar o resultado.
 - Na entrega, indicar o guia como referência de uso.
 
 **Situação:** Não executado.
@@ -332,7 +332,9 @@ Minha skill em ~/.claude/skills/deploy não está sendo acionada automaticamente
 - Executar a validação estrutural com `--biblioteca --estrito`.
 - Não instalar globalmente sem autorização.
 
-**Situação:** Aprovado (2026-11-05), com ressalvas. 5 de 6 critérios comprovados; a validação com `--estrito` não foi executada.
+**Situação:** Aprovado (2026-11-05), com ressalvas. A `api-rest-docs` gerada foi aprovada com `--biblioteca --estrito` em revalidação posterior (ver abaixo). Durante a criação original, o comando estrito **não** foi executado: aquela execução comprovou 5 de 6 critérios, e o critério de `--estrito` ainda precisa ser confirmado em uma nova criação com o fluxo atualizado.
+
+**Situação na execução original:** Aprovado (2026-11-05), com ressalvas. 5 de 6 critérios comprovados; a validação com `--estrito` não foi executada.
 
 **Ambiente:** nova sessão do Claude Code, com a entrada especificada. Skill gerada: `api-rest-docs`, em `skills/api-rest-docs/`.
 
@@ -348,12 +350,25 @@ Minha skill em ~/.claude/skills/deploy não está sendo acionada automaticamente
 **Problemas identificados:**
 
 - Divergência entre este critério e o fluxo da `skill-create`: a seção "Validação" do `SKILL.md` exige apenas `--biblioteca`, e foi isso o que a execução seguiu. Decidir se `--estrito` deve passar a ser exigido no `SKILL.md` ou se o critério deste teste deve ser ajustado.
+  - **Resolvido (2026-11-05):** o `SKILL.md` e o `references/processo-validacao.md` passaram a exigir `--biblioteca --estrito` para Skills da biblioteca, mantendo a validação sem `--biblioteca` para Skills externas.
 
 **Limitações:**
 
 - A evidência foi registrada a partir dos logs da mesma sessão que executou a criação.
 - Execução única.
 - Repetir após resolver a divergência sobre `--estrito`.
+
+### Revalidação estrita (2026-11-05)
+
+**Contexto:** executada depois de o fluxo da `skill-create` passar a exigir `--biblioteca --estrito`, sem alterar nenhum arquivo da `api-rest-docs`. Não é uma nova execução do cenário de criação.
+
+**Comandos e resultados** (a partir de `skills/skill-create/`):
+
+- `python3 scripts/validar-skill.py ../api-rest-docs --biblioteca --estrito`: 0 erros, 0 avisos, `Resultado: APROVADO`, saída 0.
+- `python3 scripts/validar-skill.py . --biblioteca --estrito` (a própria `skill-create`): na primeira execução, 2 erros e `Resultado: REPROVADO`, saída 1, porque a evidência complementar do TESTE-009 citava `mapeamento-openapi.md` e `validar-openapi.py` com caminhos relativos e o validador os tratou como arquivos da `skill-create`. Depois que esses caminhos foram reescritos com o prefixo `skills/api-rest-docs/`, sem mudar o conteúdo da evidência: 0 erros, 0 avisos, `Resultado: APROVADO`, saída 0.
+- `python3 scripts/validar-skill.py ../api-rest-docs`, sem `--biblioteca`, como validação de Skill externa: `Resultado: APROVADO`, saída 0. A validação sem o padrão da biblioteca continua disponível.
+
+**Pendência:** repetir o cenário completo (`/skill-create Crie uma Skill para documentar APIs REST.`) em uma sessão nova para comprovar que a `skill-create` executa `--biblioteca --estrito` por conta própria durante a criação.
 
 ## Registro dos resultados
 
