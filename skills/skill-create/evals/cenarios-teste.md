@@ -192,6 +192,25 @@ Explique como funciona um índice no MariaDB.
 - A evidência é um resumo da resposta fornecido pelo usuário, não uma transcrição integral.
 - Repetir sem as instruções adicionais para confirmar o comportamento padrão.
 
+### Evidência complementar — recriação da `api-rest-docs` (2026-11-05)
+
+**Ambiente:** nova sessão do Claude Code, com a entrada `/skill-create Crie uma Skill para documentar APIs REST.` e nenhuma instrução adicional. O pedido não especificou o idioma.
+
+**Resultado observado:**
+
+- Toda a comunicação ocorreu em pt-BR: explicações entre etapas, as três perguntas de requisitos (fonte, formato e stack) e o relatório de entrega.
+- A Skill `api-rest-docs` foi efetivamente criada em `skills/api-rest-docs/`, com `SKILL.md`, `references/mapeamento-openapi.md`, `scripts/validar-openapi.py`, `evals/cenarios-teste.md` e `examples/como-usar.md`. A `description`, as instruções, a referência, os cenários, o guia e as mensagens do script estão em pt-BR, e o `SKILL.md` gerado contém a seção "Idioma obrigatório".
+- Os identificadores técnicos foram preservados: `name: api-rest-docs`, chaves OpenAPI (`openapi`, `paths`, `components`, `requestBody`, `securitySchemes`), a extensão `x-revisar`, métodos HTTP, `$ARGUMENTS`, `${CLAUDE_SKILL_DIR}` e comandos.
+- Validação estrutural: `python3 scripts/validar-skill.py ../api-rest-docs --biblioteca` resultou em 0 erros, 0 avisos e `Resultado: APROVADO`.
+
+**Critérios de idioma:** aprovados nesta execução. Responder, produzir instruções e escrever a documentação em pt-BR foram atendidos sem reforço explícito no pedido, e os identificadores técnicos foram preservados. Isso supre a limitação histórica de que o idioma só havia sido observado com instrução explícita e sem arquivos criados.
+
+**Limitações:**
+
+- O acionamento automático da `api-rest-docs` e sua execução em um projeto real ainda não foram comprovados (TESTE-001 a TESTE-007 da própria Skill: Não executado).
+- A evidência foi registrada a partir dos logs da mesma sessão que executou a criação.
+- O resultado histórico acima permanece válido para a execução a que se refere.
+
 ## TESTE-010 — Validação
 
 **Entrada:**
@@ -297,6 +316,44 @@ Minha skill em ~/.claude/skills/deploy não está sendo acionada automaticamente
 **Situação:** Aprovado (2026-11-05).
 
 **Evidência:** Skills de teste criadas em diretório temporário; todos os casos produziram a classificação e o código de saída esperados. A regressão dos casos do TESTE-012 (frontmatter na linha 2, BOM, sem fechamento, sem `description`, `name` inválido, propriedade desconhecida, comando perigoso, referência quebrada, bloco `>` com lista e caminho do projeto, uso incorreto) manteve os resultados. A `skill-create` foi aprovada com `--estrito --biblioteca` depois da reorganização do seu guia; antes dela, foi reprovada por faltarem as seções Objetivo, Como invocar, Entradas, Resultados esperados e Limitações conhecidas.
+
+## TESTE-015 — Criação automática do guia de utilização
+
+**Entrada:**
+
+/skill-create Crie uma Skill para documentar APIs REST.
+
+**Resultado esperado:**
+
+- Criar o `SKILL.md`.
+- Criar espontaneamente `examples/como-usar.md`, sem solicitação explícita.
+- Incluir as seções obrigatórias do guia.
+- Produzir documentação em pt-BR.
+- Executar a validação estrutural com `--biblioteca --estrito`.
+- Não instalar globalmente sem autorização.
+
+**Situação:** Aprovado (2026-11-05), com ressalvas. 5 de 6 critérios comprovados; a validação com `--estrito` não foi executada.
+
+**Ambiente:** nova sessão do Claude Code, com a entrada especificada. Skill gerada: `api-rest-docs`, em `skills/api-rest-docs/`.
+
+**Critérios:**
+
+- Criar o `SKILL.md` — atendido: `skills/api-rest-docs/SKILL.md`, com 97 linhas e frontmatter iniciado na linha 1.
+- Criar espontaneamente `examples/como-usar.md` — atendido: criado sem que o pedido ou as respostas às perguntas de requisitos o mencionassem.
+- Incluir as seções obrigatórias do guia — atendido: o validador informou "examples/como-usar.md contém as 7 seções mínimas" e "mostra a invocação '/api-rest-docs'".
+- Produzir documentação em pt-BR — atendido: ver a evidência complementar do TESTE-009.
+- Executar a validação estrutural com `--biblioteca --estrito` — **não atendido**: o comando executado foi `python3 scripts/validar-skill.py ../api-rest-docs --biblioteca`, sem `--estrito`, com resultado 0 erros, 0 avisos e `APROVADO`. Como não houve avisos, o resultado com `--estrito` provavelmente seria o mesmo, mas isso não foi executado.
+- Não instalar globalmente sem autorização — atendido: `ls -la ~/.claude/skills/api-rest-docs` confirmou que o destino não existia, e o link simbólico foi apenas oferecido na entrega.
+
+**Problemas identificados:**
+
+- Divergência entre este critério e o fluxo da `skill-create`: a seção "Validação" do `SKILL.md` exige apenas `--biblioteca`, e foi isso o que a execução seguiu. Decidir se `--estrito` deve passar a ser exigido no `SKILL.md` ou se o critério deste teste deve ser ajustado.
+
+**Limitações:**
+
+- A evidência foi registrada a partir dos logs da mesma sessão que executou a criação.
+- Execução única.
+- Repetir após resolver a divergência sobre `--estrito`.
 
 ## Registro dos resultados
 
