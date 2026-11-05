@@ -21,9 +21,13 @@ claude-skills/
 └── skills/
     └── skill-create/
         ├── SKILL.md
+        ├── examples/
         ├── references/
+        ├── scripts/
         └── evals/
 ```
+
+Toda Skill da biblioteca inclui `examples/como-usar.md`, um guia prático de utilização em pt-BR. Para o Claude Code, apenas o `SKILL.md` é obrigatório.
 
 A estrutura será expandida conforme novas Skills forem desenvolvidas.
 
