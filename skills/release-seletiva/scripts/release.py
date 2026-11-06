@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Análise e preparação de releases seletivas (Skill release-seletiva).
+"""Análise e preparação de releases seletivas (Skill release-seletiva), versão 1.1.0.
 
 Uso:
     release.py listar    [opções comuns] [--detalhes]
     release.py planejar  [opções comuns] [--projetos A,B] [--commits SHA,...]
     release.py preparar  [opções comuns] [--projetos A,B] [--commits SHA,...]
                          --branch NOME --assinatura HASH [--aceitar-bloqueios] [--aceitar-atencao]
+                         [--aceitar-divergencia] [--aceitar-parcial] [--aceitar-indeterminado]
     release.py continuar
     release.py resumo    [--branch NOME]
 
@@ -23,7 +24,9 @@ Efeitos no repositório:
     objetos em um diretório temporário fora do repositório, removido ao final.
     preparar cria a branch de release a partir da base e aplica `cherry-pick -x`;
     continuar retoma a fila após uma resolução manual. O estado fica em
-    .git/release-seletiva/ (fora do versionamento).
+    .git/release-seletiva-skill/ (fora do versionamento). Estados gravados pela v1.0.0 em
+    .git/release-seletiva/<branch>.json continuam sendo lidos; nenhum outro arquivo dessa
+    pasta (ex.: de outra ferramenta de release) é lido, alterado ou apagado.
     O script nunca faz push, merge, reset, rebase, revert, abort, nem apaga ou
     sobrescreve branches.
 
@@ -36,14 +39,33 @@ Autorizações do preparar (controles separados, ambos validados antes de criar 
                          (trailer `cherry picked from commit`) cujo conteúdo é diferente do
                          original. Sem ela, o preparar recusa. Para reaplicar um desses commits
                          em vez de descartá-lo, selecione-o explicitamente com --commits.
-    Dependências e divergências fazem parte da assinatura: se mudarem, a assinatura confirmada
-    deixa de valer e a autorização não é reaproveitada.
+                         Vale para o commit individual e para o merge inteiro (mesma situação:
+                         trailer na base com conteúdo diferente).
+    --aceitar-parcial    libera aplicar só o restante de um projeto que já tem parte em produção.
+    --aceitar-indeterminado
+                         libera manter fora da release os commits de um merge INDETERMINADO.
+    Nenhuma autorização libera outra. Dependências, divergências, parciais e indeterminados fazem
+    parte da assinatura: se mudarem, a assinatura confirmada deixa de valer.
 
 Detecção de commits já em produção (método mostrado em `listar --detalhes`):
+  Por commit (cherry-pick individual):
     patch-id     conteúdo equivalente na base (com ou sem trailer): promovido.
     trailer      trailer na base, mas conteúdo diferente: DIVERGENTE, continua pendente
                  até ser revisado (alerta ATENÇÃO e --aceitar-divergencia).
     heurística   mesmo autor, data e assunto, conteúdo diferente: SUSPEITO, continua no plano.
+  Por merge (`cherry-pick -x -m 1` do merge da origem), só para o que a camada por commit não
+  resolveu; compara a diferença do merge em relação ao 1º pai (M^1..M):
+    merge -x + patch-id      trailer aponta para M e o conteúdo é igual: CONFIRMADO.
+    merge -x + reprodução    trailer aponta para M e reaplicar M sobre o pai do commit da base
+                             gera exatamente a mesma árvore, sem conflito: CONFIRMADO.
+    merge -x, diferente      trailer aponta para M, sem conteúdo igual nem reprodução: DIVERGENTE.
+    merge, conteúdo          sem trailer, um único commit da base com o mesmo conteúdo:
+                             EQUIVALENTE (sem rastreabilidade comprovada).
+    sem evidência            reaplicar não muda nada, conteúdo ambíguo ou conflito em arquivos que
+                             a base alterou por commits sem correspondência na origem: INDETERMINADO.
+  Reaplicar sem produzir alteração nunca basta para considerar um projeto promovido.
+  O plano nunca aplica commits de merge: só os commits do projeto. Alterações herdadas por merges
+  internos (de outros projetos ou da base) não são reaplicadas.
 
 Códigos de saída:
     0  Sucesso.
@@ -71,6 +93,10 @@ SEP_REG = "\x1e"
 SEP_CAMPO = "\x1f"
 LIMITE_COMMITS_LISTA = 8
 RE_TRAILER = re.compile(r"cherry picked from commit ([0-9a-f]{40})")
+RE_REVERT = re.compile(r"This reverts commit ([0-9a-f]{40})")
+DIR_ESTADO = "release-seletiva-skill"
+DIR_ESTADO_LEGADO = "release-seletiva"   # v1.0.0; compartilhado com outras ferramentas em alguns repositórios
+TRACAVEIS = ("patch-id + trailer", "patch-id + trailer do merge", "merge -x + patch-id", "merge -x + reprodução")
 PADROES_MERGE = [
     re.compile(r"^Merge (?:remote-tracking )?branch '([^']+)'"),
     re.compile(r'^Merge (?:remote-tracking )?branch "([^"]+)"'),
@@ -136,6 +162,30 @@ def arquivos_em_conflito():
 
 def curto(sha):
     return sha[:9]
+
+
+class ObjetosTemporarios(object):
+    """`git merge-tree` gravando objetos num diretório temporário: o repositório não é alterado."""
+
+    def __enter__(self):
+        self.dir = tempfile.mkdtemp(prefix="release-seletiva-")
+        self.env = dict(os.environ, GIT_OBJECT_DIRECTORY=self.dir,
+                        GIT_ALTERNATE_OBJECT_DIRECTORIES=caminho_git("objects"))
+        return self
+
+    def __exit__(self, *exc):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def merge_tree(self, merge_base, nosso, deles):
+        """Retorna (estado, árvore, arquivos em conflito); estado: ok, conflito ou erro."""
+        p = executar_git(["merge-tree", "--write-tree", "--name-only", "--no-messages",
+                          "--merge-base=" + merge_base, nosso, deles], check=False, env=self.env)
+        linhas = p.stdout.splitlines()
+        if p.returncode == 0 and linhas:
+            return "ok", linhas[0].strip(), []
+        if p.returncode == 1 and linhas:
+            return "conflito", linhas[0].strip(), [l for l in linhas[1:] if l.strip()]
+        return "erro", None, []
 
 
 def resumir(itens, limite):
@@ -224,10 +274,21 @@ class Analise(object):
         self.metodo = {}       # sha -> (método de detecção, sha na base)
         self.patch_id = {}
         self.resolucoes = {}   # merge -> arquivos com resolução manual
+        self.introduzidos = {}  # merge da origem -> commits (sem merge) que ele trouxe
+        self.base_pid = {}      # commit da base (janela) -> patch-id
+        self.pid_contagem = {}  # patch-id -> quantos commits da base o têm
+        self.base_trailers = {}  # commit da base -> origens citadas em `cherry picked from commit`
+        self.trailer_merge = {}  # merge da origem -> commits da base que o citam
+        self.revertidos = {}    # commit da base -> commit da base que o reverte
+        self.unidades = {}      # merge da origem -> avaliação no nível de merge
+        self.via_merge = {}     # commit promovido pela camada de merge -> merge
+        self.revisao = {}       # commit que exige revisão (merge divergente/indeterminado) -> merge
+        self.janela = None
         self._carregar()
         self._atribuir()
         self._patch_ids()
         self._promovidos()
+        self._merges()
         self._resolucoes()
 
     # -- carga
@@ -258,6 +319,7 @@ class Analise(object):
             proj.merges.append(m)
             proj.pontas.extend(cm.pais[1:])
             self.dono[m] = chave
+            trazidos = self.introduzidos.setdefault(m, [])
             pilha = list(cm.pais[1:])
             while pilha:
                 c = pilha.pop()
@@ -266,6 +328,8 @@ class Analise(object):
                 visitados.add(c)
                 self.dono[c] = chave
                 (proj.internos if self.commits[c].merge else proj.commits).append(c)
+                if not self.commits[c].merge:
+                    trazidos.append(c)
                 pilha.extend(self.commits[c].pais)
         for proj in self.projetos.values():
             proj.commits.sort(key=lambda s: self.commits[s].ordem)
@@ -282,11 +346,14 @@ class Analise(object):
             return
         inicio = datetime.datetime.fromtimestamp(min(int(c.ct) for c in sem_merge) - 86400)
         janela = ["--no-merges", "--since=" + inicio.strftime("%Y-%m-%d %H:%M:%S"), self.base_sha]
+        self.janela = janela
         log = g("log", "-p", "--format=commit %H", *janela)
         pids_base = {}
         for linha in executar_git(["patch-id", "--stable"], entrada=log).stdout.splitlines():
             pid, sha = linha.split()
             pids_base.setdefault(pid, sha)
+            self.base_pid[sha] = pid
+            self.pid_contagem[pid] = self.pid_contagem.get(pid, 0) + 1
         for c in sem_merge:
             pid = self.patch_id.get(c.sha)
             if pid in pids_base:
@@ -297,8 +364,17 @@ class Analise(object):
         indice = {}
         for bloco in out.split(SEP_REG)[1:]:
             sha, email, at, assunto, corpo = bloco.split(SEP_CAMPO, 4)
-            for orig in RE_TRAILER.findall(corpo):
-                if orig not in self.commits or self.commits[orig].merge:
+            origens = RE_TRAILER.findall(corpo)
+            if origens:
+                self.base_trailers[sha] = origens
+            for rev in RE_REVERT.findall(corpo):
+                self.revertidos.setdefault(rev, sha)
+            for orig in origens:
+                if orig in self.commits and self.commits[orig].merge:
+                    # `cherry-pick -x -m 1` de um merge: avaliado na camada de merge (_merges)
+                    self.trailer_merge.setdefault(orig, []).append(sha)
+                    continue
+                if orig not in self.commits:
                     continue
                 if orig in self.promovidos:
                     if self.metodo.get(orig) == ("patch-id", sha):
@@ -327,6 +403,185 @@ class Analise(object):
         for linha in out.splitlines():
             pid, sha = linha.split()
             self.patch_id[sha] = pid
+
+    # -- camada de merge: promoções por `cherry-pick -x -m 1` do merge da origem
+    def _diffs_merges(self, merges):
+        """merge -> (patch-id da diferença M^1..M ou None, arquivos dessa diferença). Uma chamada em lote."""
+        entrada = "\n".join(merges) + "\n"
+        p = executar_git(["-c", "core.quotepath=off", "log", "--no-walk=unsorted", "--stdin",
+                          "--diff-merges=first-parent", "-p", "--format=commit %H"], check=False, entrada=entrada)
+        if p.returncode == 0:
+            texto = p.stdout
+        else:  # git sem --diff-merges: um diff por merge
+            texto = "".join("commit %s\n\n%s" % (m, g("-c", "core.quotepath=off", "diff", self.commits[m].pais[0], m))
+                            for m in merges)
+        arquivos, atual = {}, None
+        for linha in texto.splitlines():
+            if linha.startswith("commit ") and len(linha) == 47:
+                atual = linha[7:]
+                arquivos[atual] = set()
+            elif linha.startswith("diff --git ") and atual:
+                arquivos[atual].add(linha.rsplit(" b/", 1)[-1])
+        pids = {}
+        for linha in executar_git(["patch-id", "--stable"], entrada=texto).stdout.splitlines():
+            pid, sha = linha.split()
+            pids[sha] = pid
+        return dict((m, (pids.get(m), arquivos.get(m, set()))) for m in merges)
+
+    def _arquivos_alheios(self, pids_origem):
+        """Arquivos alterados por commits que só existem na base (origem..base, na janela de datas) e não
+        têm correspondência na origem (nem trailer, nem patch-id) -> commits. Ex.: correção direta na produção."""
+        alheios = {}
+        if not self.janela:
+            return alheios
+        out = g("-c", "core.quotepath=off", "log", "--no-renames", "--name-only",
+                "--format=" + SEP_REG + "%H" + SEP_CAMPO, *(self.janela[:-1] + ["^" + self.origem_sha, self.base_sha]))
+        for bloco in out.split(SEP_REG)[1:]:
+            sha, nomes = bloco.split(SEP_CAMPO, 1)
+            if any(o in self.commits for o in self.base_trailers.get(sha, [])):
+                continue
+            if self.base_pid.get(sha) in pids_origem:
+                continue
+            for f in nomes.splitlines():
+                if f.strip():
+                    alheios.setdefault(f.strip(), []).append(sha)
+        return alheios
+
+    def _merges(self):
+        # commit reconhecido por patch-id cujo commit na base cita (-x) o merge que o introduziu: rastreável
+        for c, (metodo, b) in list(self.metodo.items()):
+            if metodo == "patch-id" and any(o in self.commits and c in self.introduzidos.get(o, [])
+                                            for o in self.base_trailers.get(b, [])):
+                self.metodo[c] = ("patch-id + trailer do merge", b)
+        alvo = []
+        for proj in self.projetos.values():
+            for m in proj.merges:
+                trazidos = self.introduzidos.get(m, [])
+                if trazidos and any(c not in self.promovidos for c in trazidos):
+                    alvo.append(m)
+        if not alvo:
+            return
+        diffs = self._diffs_merges(alvo)
+        pids_origem = set(self.patch_id.values()) | set(p for p, _ in diffs.values() if p)
+        self._alheios_cache = None
+        self._diferentes_cache = None
+        base_tree = g("rev-parse", self.base_sha + "^{tree}").strip()
+        with ObjetosTemporarios() as tmp:
+            for m in alvo:
+                u = self._avaliar_merge(m, diffs[m], tmp, base_tree, pids_origem)
+                self.unidades[m] = u
+                pend = [c for c in self.introduzidos[m] if c not in self.promovidos]
+                if u["situacao"] in ("confirmado", "equivalente"):
+                    for c in pend:
+                        self.promovidos[c] = "promovido pelo merge %s em %s (%s)" % (curto(m), curto(u["base"]), u["metodo"])
+                        self.metodo[c] = (u["metodo"], u["base"])
+                        self.via_merge[c] = m
+                        self.suspeitos.pop(c, None)
+                        self.divergentes.pop(c, None)
+                elif u["situacao"] in ("divergente", "indeterminado"):
+                    for c in pend:
+                        if c not in self.divergentes:
+                            self.revisao[c] = m
+
+    def _avaliar_merge(self, m, diff, tmp, base_tree, pids_origem):
+        pid_m, arquivos_m = diff
+        trazidos = self.introduzidos[m]
+        pend = [c for c in trazidos if c not in self.promovidos]
+        u = {"merge": m, "base": None, "metodo": None, "situacao": "pendente", "motivo": "",
+             "herdados": sorted(arquivos_m - self.arquivos(trazidos)), "revertido": None}
+        pai = self.commits[m].pais[0]
+        bases = self.trailer_merge.get(m, [])
+        if bases:
+            resultados = []
+            for b in bases:
+                if pid_m and self.base_pid.get(b) == pid_m:
+                    resultados.append(("merge -x + patch-id", b))
+                    continue
+                estado, arvore, _ = tmp.merge_tree(pai, b + "^1", m)
+                if estado == "ok" and arvore == g("rev-parse", b + "^{tree}").strip():
+                    resultados.append(("merge -x + reprodução", b))
+                elif estado == "erro":
+                    resultados.append(("indisponível", b))
+                else:
+                    resultados.append((None, b))
+            confirmados = [r for r in resultados if r[0] not in (None, "indisponível")]
+            if confirmados and len(confirmados) == len(resultados):
+                u.update(situacao="confirmado", metodo=confirmados[0][0], base=confirmados[0][1],
+                         revertido=self.revertidos.get(confirmados[0][1]))
+            elif confirmados:
+                u.update(situacao="indeterminado", base=confirmados[0][1],
+                         motivo="citado por %d commits da base (%s) com resultados diferentes"
+                         % (len(resultados), ", ".join(curto(b) for _, b in resultados)))
+            elif any(r[0] == "indisponível" for r in resultados):
+                u.update(situacao="indeterminado", base=bases[0],
+                         motivo="registrado como cherry-pick em %s, conteúdo diferente e reprodução indisponível "
+                                "(requer git 2.45+)" % curto(bases[0]))
+            else:
+                u.update(situacao="divergente", metodo="merge -x, diferente", base=bases[0],
+                         motivo="registrado como cherry-pick em %s, mas o conteúdo é diferente e reaplicar o merge "
+                                "sobre %s^1 não reproduz o commit (edição manual ou promoção parcial); revise com "
+                                "`git diff %s^1 %s` × `git show %s`" % (curto(bases[0]), curto(bases[0]),
+                                                                          curto(m), curto(m), curto(bases[0])))
+            return u
+        if pid_m and self.pid_contagem.get(pid_m) == 1:
+            b = next(s for s, p in self.base_pid.items() if p == pid_m)
+            u.update(situacao="equivalente", metodo="merge, conteúdo equivalente", base=b,
+                     revertido=self.revertidos.get(b))
+            return u
+        if pid_m and self.pid_contagem.get(pid_m, 0) > 1:
+            u.update(situacao="indeterminado", motivo="o conteúdo do merge aparece em %d commits da base, sem registro "
+                     "de cherry-pick (correspondência ambígua)" % self.pid_contagem[pid_m])
+            return u
+        if len(pend) < len(trazidos):
+            u.update(situacao="parcial", motivo="%d de %d commit(s) já estão na base (por commit)"
+                     % (len(trazidos) - len(pend), len(trazidos)))
+            return u
+        if any(c in self.suspeitos or c in self.divergentes for c in pend):
+            return u   # já sinalizado pela camada por commit (suspeito/divergente)
+        arquivos_pend = sorted(self.arquivos(pend))
+        if self._diferentes_cache is None:   # uma chamada para todos os merges
+            self._diferentes_cache = set(l for l in g("-c", "core.quotepath=off", "diff", "--name-only", "--no-renames",
+                                                       self.base_sha, self.origem_sha).splitlines() if l)
+        if arquivos_pend and not any(f in self._diferentes_cache for f in arquivos_pend):
+            u.update(situacao="indeterminado", motivo="os arquivos do projeto (%s) já estão idênticos na base e na "
+                     "origem: o conteúdo atual da origem já está na produção, mas não há registro de promoção (a "
+                     "alteração pode ter sido absorvida ou reescrita por outro merge)" % resumir(arquivos_pend, 3))
+            return u
+        estado, arvore, conflitos = tmp.merge_tree(pai, self.base_sha, m)
+        if estado == "ok" and arvore == base_tree:
+            u.update(situacao="indeterminado", motivo="reaplicar o merge não muda nada na base, mas não há registro de "
+                     "cherry-pick nem commit com o mesmo conteúdo: a alteração pode ter entrado por outro caminho")
+        elif estado == "conflito":
+            if self._alheios_cache is None:
+                self._alheios_cache = self._arquivos_alheios(pids_origem)
+            alheios = [(f, self._alheios_cache[f]) for f in conflitos if f in self._alheios_cache]
+            if alheios:
+                u.update(situacao="indeterminado", motivo="conflito em %s, que a base alterou por commit(s) sem "
+                         "correspondência na origem (%s): parte da alteração pode já estar na base" % (
+                             resumir([f for f, _ in alheios], 3),
+                             resumir(sorted(set(curto(s) for _, ss in alheios for s in ss)), 4)))
+        return u
+
+    def promocao_revertida(self, proj):
+        """Algum commit da base que promoveu o projeto foi revertido depois (`This reverts commit`)."""
+        return any(self.metodo.get(c, (None, None))[1] in self.revertidos for c in proj.commits if c in self.promovidos)
+
+    def situacao(self, proj):
+        """confirmado | equivalente | parcial | pendente | indeterminado | divergente | sem-commits."""
+        if not proj.commits:
+            return "sem-commits"
+        pend = self.pendentes(proj)
+        if not pend:
+            return "confirmado" if all(self.metodo.get(c, ("",))[0] in TRACAVEIS for c in proj.commits) \
+                else "equivalente"
+        if any(c in self.divergentes for c in pend) or \
+                any(self.unidades.get(self.revisao[c], {}).get("situacao") == "divergente" for c in pend if c in self.revisao):
+            return "divergente"
+        if any(c in self.revisao for c in pend):
+            return "indeterminado"
+        if len(pend) < len(proj.commits):
+            return "parcial"
+        return "pendente"
 
     def _resolucoes(self):
         for proj in self.projetos.values():
@@ -412,6 +667,9 @@ class Analise(object):
 
 # -------------------------------------------------------------------------- plano
 
+FLAG_REVISAO = {"divergente": "--aceitar-divergencia", "indeterminado": "--aceitar-indeterminado"}
+
+
 class Plano(object):
     def __init__(self, analise, projetos, extras):
         a = analise
@@ -421,6 +679,8 @@ class Plano(object):
         self.ordem, self.ignorados, self.alertas = [], [], []
         self.dependencias = []   # dependências ATENÇÃO de projetos selecionados em não selecionados
         self.divergencias = []   # commits com trailer na base e conteúdo diferente, que ficariam de fora
+        self.revisoes = []       # merges divergentes/indeterminados cujos commits ficariam de fora
+        self.parciais = []       # projetos com parte em produção dos quais só o restante seria aplicado
         chaves = set(p.chave for p in projetos)
         self.excluidos = [p.chave for p in a.projetos.values() if a.pendentes(p) and p.chave not in chaves]
         vistos_pid = {}
@@ -436,6 +696,19 @@ class Plano(object):
                                             "(não aplicado; exige revisão e --aceitar-divergencia)" % curto(base)))
                 self.divergencias.append({"commit": sha, "base": base, "projeto": a.dono.get(sha)})
                 continue
+            if sha in a.revisao and sha not in extras:
+                m = a.revisao[sha]
+                u = a.unidades[m]
+                flag = FLAG_REVISAO[u["situacao"]]
+                self.ignorados.append((sha, "merge %s %s (não aplicado; exige revisão e %s)"
+                                       % (curto(m), u["situacao"].upper(), flag)))
+                item = next((r for r in self.revisoes if r["merge"] == m), None)
+                if item is None:
+                    item = {"projeto": a.dono.get(sha), "merge": m, "situacao": u["situacao"], "base": u["base"],
+                            "motivo": u["motivo"], "commits": []}
+                    self.revisoes.append(item)
+                item["commits"].append(sha)
+                continue
             pid = a.patch_id.get(sha)
             if pid and pid in vistos_pid:
                 self.ignorados.append((sha, "duplicado de %s (mesmo patch)" % curto(vistos_pid[pid])))
@@ -443,6 +716,15 @@ class Plano(object):
             if pid:
                 vistos_pid[pid] = sha
             self.ordem.append(sha)
+        aplicar = set(self.ordem)
+        for proj in projetos:
+            ja = [c for c in proj.commits if c in a.promovidos]
+            resto = [c for c in proj.commits if c in aplicar]
+            if ja and resto:
+                self.parciais.append({"projeto": proj.chave, "em_producao": len(ja), "aplicados": len(resto),
+                                      "merges_promovidos": [m for m in proj.merges
+                                                            if a.unidades.get(m, {}).get("situacao") in
+                                                            ("confirmado", "equivalente")]})
         self._alertas(chaves)
 
     def _alerta(self, nivel, texto):
@@ -458,7 +740,13 @@ class Plano(object):
                 self._alerta("ATENÇÃO", "%s é um commit isolado do projeto %s, que não foi selecionado inteiro."
                              % (curto(sha), dono))
         for proj in self.projetos:
-            if not a.pendentes(proj):
+            if not proj.commits:
+                donos = sorted(set(a.dono.get(c) for c in a.ancestrais(proj.pontas, True)
+                                   if not a.commits[c].merge and a.dono.get(c) not in (None, proj.chave)))
+                self._alerta("ATENÇÃO", "%s não tem commits próprios: os commits da branch entraram na origem pelo merge "
+                             "de %s. Nada será aplicado por este projeto; selecione o outro projeto ou os commits com "
+                             "--commits." % (proj.chave, resumir(donos, 4) or "outro projeto"))
+            elif not a.pendentes(proj):
                 self._alerta("INFO", "%s: todos os commits já estão em produção." % proj.chave)
             depende, base = a.entrelacados(proj)
             for outro, shas in sorted(depende.items()):
@@ -519,6 +807,22 @@ class Plano(object):
                 self._alerta("INFO", "%s está registrado como cherry-pick em %s na base com conteúdo diferente; será "
                              "reaplicado por escolha explícita (--commits) e pode conflitar ou ficar vazio."
                              % (curto(sha), curto(a.divergentes[sha])))
+        for r in self.revisoes:
+            self._alerta("ATENÇÃO", "%s: merge %s %s — %s. Os %d commit(s) desse merge não serão aplicados: mantê-los "
+                         "fora exige %s; para reaplicá-los, selecione-os com --commits." % (
+                             r["projeto"], curto(r["merge"]), r["situacao"].upper(), r["motivo"],
+                             len(r["commits"]), FLAG_REVISAO[r["situacao"]]))
+        for sha in sorted(self.extras, key=lambda s: a.commits[s].ordem):
+            if sha in a.revisao:
+                self._alerta("INFO", "%s pertence ao merge %s (%s); será reaplicado por escolha explícita (--commits) e "
+                             "pode conflitar ou ficar vazio." % (curto(sha), curto(a.revisao[sha]),
+                                                                 a.unidades[a.revisao[sha]]["situacao"].upper()))
+        for p in self.parciais:
+            self._alerta("ATENÇÃO", "PARCIAL: %s já tem %d commit(s) em produção%s; serão aplicados só os %d restantes. "
+                         "Confirme que o restante faz sentido sozinho (--aceitar-parcial)." % (
+                             p["projeto"], p["em_producao"],
+                             " (merges promovidos: %s)" % ", ".join(curto(m) for m in p["merges_promovidos"])
+                             if p["merges_promovidos"] else "", p["aplicados"]))
         por_arquivo = {}
         for proj in a.projetos_pendentes():
             if proj.chave in chaves:
@@ -545,7 +849,23 @@ class Plano(object):
                  "dependencias": self.dependencias, "excluidos": self.excluidos}
         if self.divergencias:   # só quando existem, para não alterar assinaturas de planos sem divergência
             dados["divergencias"] = self.divergencias
+        if self.revisoes:
+            dados["revisoes"] = self.revisoes
+        if self.parciais:
+            dados["parciais"] = self.parciais
         return hashlib.sha256(json.dumps(dados, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+    def revisoes_de(self, situacao):
+        return [r for r in self.revisoes if r["situacao"] == situacao]
+
+    def linhas_revisoes(self, situacao, prefixo="  "):
+        return ["%s- %s [%s] merge %s: %d commit(s) ficam fora da release%s" % (
+            prefixo, r["situacao"].upper(), r["projeto"], curto(r["merge"]), len(r["commits"]),
+            "; base tem %s" % curto(r["base"]) if r["base"] else "") for r in self.revisoes_de(situacao)]
+
+    def linhas_parciais(self, prefixo="  "):
+        return ["%s- %s: %d commit(s) já em produção, %d a aplicar" % (
+            prefixo, p["projeto"], p["em_producao"], p["aplicados"]) for p in self.parciais]
 
     def linhas_divergencias(self, prefixo="  "):
         return ["%s- %s [%s] fica fora da release; base tem %s com conteúdo diferente" % (
@@ -612,6 +932,12 @@ def cmd_listar(args, analise, avisos):
     cabecalho(a, avisos)
     pendentes = a.projetos_pendentes()
     print("PROJETOS NA ORIGEM AINDA NÃO PROMOVIDOS: %d (ordem de entrada na origem)" % len(pendentes))
+    contagem = {}
+    for proj in pendentes:
+        contagem[a.situacao(proj)] = contagem.get(a.situacao(proj), 0) + 1
+    if set(contagem) - {"pendente"}:
+        print("  Situação: %s" % ", ".join("%d %s" % (contagem[s], s) for s in
+                                            ("pendente", "parcial", "indeterminado", "divergente") if s in contagem))
     for i, proj in enumerate(pendentes, 1):
         pend = a.pendentes(proj)
         datas = [a.commits[m].data for m in proj.merges]
@@ -619,6 +945,9 @@ def cmd_listar(args, analise, avisos):
         arquivos = a.arquivos(pend)
         print()
         print("[%d] %s   (nome curto: %s)" % (i, proj.chave, proj.nome_curto))
+        situacao = a.situacao(proj)
+        if situacao != "pendente":
+            print("    Situação: %s" % ROTULO_SITUACAO[situacao])
         print("    Merges na origem: %d (%s → %s): %s" % (len(proj.merges), datas[0], datas[-1],
                                                          ", ".join(curto(m) for m in proj.merges)))
         divergentes = [s for s in pend if s in a.divergentes]
@@ -637,6 +966,10 @@ def cmd_listar(args, analise, avisos):
         for s in divergentes:
             print("    ALERTA: %s está registrado como cherry-pick em %s na base, mas com conteúdo diferente "
                   "(promoção possivelmente parcial; revisar)." % (curto(s), curto(a.divergentes[s])))
+        for m in proj.merges:
+            u = a.unidades.get(m)
+            if u and u["situacao"] in ("divergente", "indeterminado"):
+                print("    ALERTA: merge %s %s — %s." % (curto(m), u["situacao"].upper(), u["motivo"]))
         depende, base = a.entrelacados(proj)
         for outro, shas in sorted(depende.items()):
             print("    ALERTA: a branch contém %d commit(s) de %s; não pode ir sem ele." % (len(shas), outro))
@@ -667,31 +1000,72 @@ def cmd_listar(args, analise, avisos):
     print()
     print("Projetos já promovidos (ocultos): %d%s" % (
         len(promovidos), " — " + ", ".join(p.nome_curto for p in promovidos) if args.detalhes and promovidos else ""))
+    revertidos = [p.nome_curto for p in promovidos if a.promocao_revertida(p)]
+    if revertidos:
+        print("  ATENÇÃO: promoção revertida depois na base em %d projeto(s): %s (veja --detalhes)."
+              % (len(revertidos), ", ".join(revertidos)))
     if args.detalhes:
+        if promovidos:
+            conf = sum(1 for p in promovidos if a.situacao(p) == "confirmado")
+            sem = sum(1 for p in promovidos if a.situacao(p) == "sem-commits")
+            print("  %d confirmado(s) por rastreabilidade e conteúdo; %d com conteúdo equivalente, sem rastreabilidade "
+                  "comprovada%s" % (conf, len(promovidos) - conf - sem,
+                                    "; %d sem commits próprios (trazidos por outro projeto)" % sem if sem else ""))
         for proj in promovidos:
-            print("  [%s]" % proj.chave)
+            print("  [%s] %s" % (proj.chave, a.situacao(proj)))
             imprimir_deteccao(a, proj, "    ")
     return 0
 
 
+ROTULO_SITUACAO = {
+    "confirmado": "PROMOVIDO CONFIRMADO (rastreabilidade e conteúdo)",
+    "equivalente": "CONTEÚDO EQUIVALENTE na produção, sem rastreabilidade comprovada",
+    "parcial": "PARCIALMENTE PROMOVIDO: parte já está na produção (o preparar exige --aceitar-parcial)",
+    "indeterminado": "INDETERMINADO: exige revisão manual (manter fora exige --aceitar-indeterminado)",
+    "divergente": "DIVERGENTE: registrado na produção com conteúdo diferente (manter fora exige --aceitar-divergencia)",
+}
+
 ROTULO_METODO = {
     "patch-id": "patch-id (conteúdo equivalente)",
     "patch-id + trailer": "patch-id + trailer cherry-pick",
+    "patch-id + trailer do merge": "patch-id + trailer -x do merge que trouxe o commit",
     "trailer, conteúdo diferente": "trailer cherry-pick, CONTEÚDO DIFERENTE: divergente, continua pendente",
     "heurística": "heurística (autor, data e assunto): suspeito, continua pendente",
+    "merge -x + patch-id": "merge: trailer -x + patch-id igual",
+    "merge -x + reprodução": "merge: trailer -x + reprodução exata sobre o pai do commit da base",
+    "merge -x, diferente": "merge: trailer -x, CONTEÚDO DIFERENTE: divergente",
+    "merge, conteúdo equivalente": "merge: conteúdo equivalente, SEM trailer (rastreabilidade não comprovada)",
 }
 
 
 def imprimir_deteccao(a, proj, recuo="    "):
-    """Lista, com hash original → hash na base e método, os commits do projeto reconhecidos na produção."""
-    achados = [s for s in proj.commits if s in a.metodo]
-    if not achados:
+    """Lista o que foi reconhecido na produção: por merge (M → commit da base) e por commit, com o método."""
+    unidades = [(m, a.unidades[m]) for m in proj.merges if m in a.unidades and a.unidades[m]["situacao"] != "pendente"]
+    achados = [s for s in proj.commits if s in a.metodo and s not in a.via_merge]
+    herdados = [(m, a.unidades[m]["herdados"]) for m in proj.merges if a.unidades.get(m, {}).get("herdados")]
+    if not unidades and not achados and not herdados:
         return
     print("%sDetecção na produção (%s):" % (recuo, a.base_ref))
+    for m, u in unidades:
+        marca = "✓" if u["situacao"] in ("confirmado", "equivalente") else "!"
+        destino = " → " + curto(u["base"]) if u["base"] else ""
+        rotulo = ROTULO_METODO.get(u["metodo"], u["situacao"].upper()) if u["metodo"] else u["situacao"].upper()
+        print("%s  %s merge %s%s  [%s] %d commit(s)%s" % (recuo, marca, curto(m), destino, rotulo,
+                                                         len(a.introduzidos.get(m, [])),
+                                                         "; " + u["motivo"] if u["motivo"] else ""))
+        if u.get("revertido"):
+            print("%s      aviso: %s foi revertido na base por %s; o conteúdo atual pode não conter o projeto."
+                  % (recuo, curto(u["base"]), curto(u["revertido"])))
     for s in achados:
         metodo, base = a.metodo[s]
         print("%s  %s %s → %s  [%s] %s" % (recuo, "✓" if s in a.promovidos else "!", curto(s), curto(base),
                                            ROTULO_METODO.get(metodo, metodo), a.commits[s].assunto[:60]))
+        if s in a.promovidos and base in a.revertidos:
+            print("%s      aviso: %s foi revertido na base por %s; o conteúdo atual pode não conter o projeto."
+                  % (recuo, curto(base), curto(a.revertidos[base])))
+    for m, arquivos in herdados:
+        print("%s  nota: o merge %s carrega alterações herdadas (não são commits do projeto) em %s; elas não são "
+              "reaplicadas pelo plano." % (recuo, curto(m), resumir(arquivos, 4)))
 
 
 def nome_branch_sugerido():
@@ -755,18 +1129,38 @@ def imprimir_plano(plano, avisos, simulacao, erro_sim):
         print("DIVERGÊNCIAS COM A PRODUÇÃO (trailer sem conteúdo equivalente): %d" % len(plano.divergencias))
         for linha in plano.linhas_divergencias():
             print(linha)
+    if plano.revisoes:
+        print()
+        print("MERGES QUE EXIGEM REVISÃO (commits fora da release até decisão): %d" % len(plano.revisoes))
+        for situacao in ("divergente", "indeterminado"):
+            for linha in plano.linhas_revisoes(situacao):
+                print(linha)
+    if plano.parciais:
+        print()
+        print("PROJETOS PARCIALMENTE PROMOVIDOS: %d" % len(plano.parciais))
+        for linha in plano.linhas_parciais():
+            print(linha)
     print()
     print(plano.linha_excluidos())
+    print("Autorizações exigidas pelo preparar: %s" % (", ".join(autorizacoes_exigidas(plano)) or "nenhuma"))
+    print()
+    print("Assinatura do plano: %s" % plano.assinatura())
+
+
+def autorizacoes_exigidas(plano):
     exigidas = []
     if plano.bloqueios:
         exigidas.append("--aceitar-bloqueios (%d BLOQUEIO(s))" % len(plano.bloqueios))
     if plano.dependencias:
         exigidas.append("--aceitar-atencao (%d dependência(s))" % len(plano.dependencias))
-    if plano.divergencias:
-        exigidas.append("--aceitar-divergencia (%d divergência(s))" % len(plano.divergencias))
-    print("Autorizações exigidas pelo preparar: %s" % (", ".join(exigidas) if exigidas else "nenhuma"))
-    print()
-    print("Assinatura do plano: %s" % plano.assinatura())
+    div = len(plano.divergencias) + len(plano.revisoes_de("divergente"))
+    if div:
+        exigidas.append("--aceitar-divergencia (%d divergência(s))" % div)
+    if plano.parciais:
+        exigidas.append("--aceitar-parcial (%d projeto(s))" % len(plano.parciais))
+    if plano.revisoes_de("indeterminado"):
+        exigidas.append("--aceitar-indeterminado (%d merge(s))" % len(plano.revisoes_de("indeterminado")))
+    return exigidas
 
 
 def cmd_planejar(args, analise, avisos):
@@ -778,8 +1172,9 @@ def cmd_planejar(args, analise, avisos):
 
 # ------------------------------------------------------------------------- estado
 
-def arquivo_estado(branch):
-    return os.path.join(caminho_git("release-seletiva"), branch.replace("/", "__") + ".json")
+def arquivo_estado(branch, legado=False):
+    pasta = DIR_ESTADO_LEGADO if legado else DIR_ESTADO
+    return os.path.join(caminho_git(pasta), branch.replace("/", "__") + ".json")
 
 
 def salvar_estado(estado):
@@ -792,11 +1187,97 @@ def salvar_estado(estado):
 
 
 def carregar_estado(branch):
+    """Lê o estado da pasta atual; se não houver, o da v1.0.0 (só o <branch>.json desta Skill).
+
+    O estado legado é lido, nunca alterado nem apagado; a próxima gravação vai para a pasta atual,
+    que passa a ter precedência.
+    """
     caminho = arquivo_estado(branch)
     if not os.path.exists(caminho):
+        legado = arquivo_estado(branch, legado=True)
+        if os.path.exists(legado):
+            with open(legado, encoding="utf-8") as f:
+                try:
+                    estado = json.load(f)
+                except ValueError:
+                    estado = None
+            if isinstance(estado, dict) and estado.get("branch") == branch and "pendentes" in estado:
+                return estado
         raise ErroUso("A branch '%s' não foi preparada por esta Skill (estado não encontrado)." % branch)
     with open(caminho, encoding="utf-8") as f:
-        return json.load(f)
+        try:
+            estado = json.load(f)
+        except ValueError:
+            raise ErroUso("Estado da release ilegível em %s. Nada foi feito." % caminho)
+    if not isinstance(estado, dict):
+        raise ErroUso("Estado da release inválido em %s. Nada foi feito." % caminho)
+    return estado
+
+
+CHAVES_ESTADO = (("branch", str), ("base_ref", str), ("base_sha", str), ("origem_ref", str), ("origem_sha", str),
+                 ("remoto", str), ("projetos", list), ("commits_avulsos", list), ("assinatura", str),
+                 ("pendentes", list), ("aplicados", list), ("vazios", list), ("ignorados", list))
+
+
+def validar_estado(estado, branch):
+    """Coerência interna do estado e com a branch atual. Recusa (ErroUso) em qualquer inconsistência."""
+    problemas = []
+    for chave, tipo in CHAVES_ESTADO:
+        if not isinstance(estado.get(chave), tipo):
+            problemas.append("campo '%s' ausente ou inválido" % chave)
+    if problemas:
+        raise ErroUso("Estado da release inconsistente (%s). Nada foi feito." % "; ".join(problemas))
+    if estado["branch"] != branch:
+        problemas.append("o estado é da branch '%s', não de '%s'" % (estado["branch"], branch))
+    for sha in [estado["base_sha"], estado["origem_sha"]] + estado["pendentes"] + estado["vazios"]:
+        if not re.match(r"^[0-9a-f]{40}$", str(sha)) or not existe_commit(sha):
+            problemas.append("commit inexistente ou inválido no estado: %s" % str(sha)[:40])
+    em_conflito = estado.get("em_conflito")
+    if em_conflito and (not estado["pendentes"] or estado["pendentes"][0] != em_conflito):
+        problemas.append("o commit em conflito (%s) não é o próximo da fila" % curto(em_conflito))
+    ponta = sha_de("refs/heads/" + branch) if existe_commit("refs/heads/" + branch) else None
+    if ponta and existe_commit(estado["base_sha"]) and \
+            executar_git(["merge-base", "--is-ancestor", estado["base_sha"], ponta], check=False).returncode != 0:
+        problemas.append("a branch não parte da base registrada (%s)" % curto(estado["base_sha"]))
+    for item in estado["aplicados"]:
+        novo = item.get("novo") if isinstance(item, dict) else None
+        if not novo or not existe_commit(novo) or (ponta and executar_git(
+                ["merge-base", "--is-ancestor", novo, ponta], check=False).returncode != 0):
+            problemas.append("commit aplicado ausente da branch: %s" % str(novo)[:12])
+    processados = [i.get("original") for i in estado["aplicados"] if isinstance(i, dict)] + estado["vazios"]
+    if len(set(processados) | set(estado["pendentes"])) != len(processados) + len(estado["pendentes"]):
+        problemas.append("commits repetidos entre aplicados, vazios e pendentes")
+    if problemas:
+        raise ErroUso("Estado da release inconsistente: %s. Nada foi feito; revise com o usuário." % "; ".join(problemas))
+
+
+def conferir_plano_do_estado(estado):
+    """Recalcula o plano com os SHAs gravados e a versão atual das regras. Retorna lista de problemas."""
+    a = Analise(estado["base_ref"], estado["base_sha"], estado["origem_ref"], estado["origem_sha"],
+                estado["remoto"], estado.get("desde"))
+    try:
+        projetos = [a.resolver_projeto(c) for c in estado["projetos"]]
+    except ErroUso as e:
+        return [str(e)]
+    extras = set(estado["commits_avulsos"])
+    if any(e not in a.commits for e in extras):
+        return ["commit avulso do estado fora de %s..%s" % (curto(estado["base_sha"]), curto(estado["origem_sha"]))]
+    plano = Plano(a, projetos, extras)
+    problemas = []
+    if plano.assinatura() != estado["assinatura"]:
+        problemas.append("a assinatura recalculada (%s) difere da confirmada (%s): o plano, com as regras atuais da "
+                         "Skill, não é mais o mesmo" % (plano.assinatura(), estado["assinatura"]))
+    fila = [i["original"] for i in estado["aplicados"]] + estado["vazios"] + estado["pendentes"]
+    if sorted(fila) != sorted(plano.ordem) or plano.ordem[len(plano.ordem) - len(estado["pendentes"]):] != estado["pendentes"]:
+        problemas.append("a fila gravada não corresponde à ordem do plano")
+    aut = estado.get("autorizacoes", {})
+    exigidas = (("aceitar_bloqueios", plano.bloqueios), ("aceitar_atencao", plano.dependencias),
+                ("aceitar_divergencia", plano.divergencias or plano.revisoes_de("divergente")),
+                ("aceitar_parcial", plano.parciais), ("aceitar_indeterminado", plano.revisoes_de("indeterminado")))
+    for chave, risco in exigidas:
+        if risco and not aut.get(chave):
+            problemas.append("o plano exige --%s, que não foi registrada no preparar" % chave.replace("_", "-"))
+    return problemas
 
 
 def verificar_repositorio_limpo():
@@ -891,6 +1372,18 @@ def cmd_preparar(args, analise, avisos):
                        "e --aceitar-divergencia não foi informado:" % len(plano.divergencias))
         recusas.extend(plano.linhas_divergencias())
         recusas.append("  Revise cada um com `git range-diff <original>^! <base>^!`; para reaplicar, use --commits.")
+    if plano.revisoes_de("divergente") and not args.aceitar_divergencia:
+        recusas.append("O plano deixaria fora %d merge(s) DIVERGENTE(S) (registro -x do merge com conteúdo diferente) "
+                       "e --aceitar-divergencia não foi informado:" % len(plano.revisoes_de("divergente")))
+        recusas.extend(plano.linhas_revisoes("divergente"))
+    if plano.revisoes_de("indeterminado") and not args.aceitar_indeterminado:
+        recusas.append("O plano deixaria fora %d merge(s) INDETERMINADO(S) e --aceitar-indeterminado não foi "
+                       "informado:" % len(plano.revisoes_de("indeterminado")))
+        recusas.extend(plano.linhas_revisoes("indeterminado"))
+    if plano.parciais and not args.aceitar_parcial:
+        recusas.append("O plano aplicaria só o restante de %d projeto(s) PARCIALMENTE PROMOVIDO(S) e --aceitar-parcial "
+                       "não foi informado:" % len(plano.parciais))
+        recusas.extend(plano.linhas_parciais())
     if recusas:
         recusas.append(plano.linha_excluidos())
         recusas.append("Avalie cada risco com o usuário (incluir o que falta, retirar o projeto, reaplicar o commit ou "
@@ -910,15 +1403,32 @@ def cmd_preparar(args, analise, avisos):
         print("DIVERGÊNCIAS ACEITAS com --aceitar-divergencia (commits não reaplicados):")
         for linha in plano.linhas_divergencias():
             print(linha)
+    if plano.revisoes_de("divergente"):
+        print("MERGES DIVERGENTES ACEITOS com --aceitar-divergencia (commits não reaplicados):")
+        for linha in plano.linhas_revisoes("divergente"):
+            print(linha)
+    if plano.revisoes_de("indeterminado"):
+        print("MERGES INDETERMINADOS ACEITOS com --aceitar-indeterminado (commits não reaplicados):")
+        for linha in plano.linhas_revisoes("indeterminado"):
+            print(linha)
+    if plano.parciais:
+        print("PARCIAIS ACEITOS com --aceitar-parcial (só o restante será aplicado):")
+        for linha in plano.linhas_parciais():
+            print(linha)
     print(plano.linha_excluidos())
     if args.aceitar_atencao and not plano.dependencias:
         print("(--aceitar-atencao informado, mas o plano não tem dependências a aceitar.)")
-    if args.aceitar_divergencia and not plano.divergencias:
+    if args.aceitar_divergencia and not (plano.divergencias or plano.revisoes_de("divergente")):
         print("(--aceitar-divergencia informado, mas o plano não tem divergências a aceitar.)")
-    if plano.dependencias or plano.bloqueios or plano.divergencias or args.aceitar_atencao or args.aceitar_divergencia:
+    if args.aceitar_parcial and not plano.parciais:
+        print("(--aceitar-parcial informado, mas o plano não tem projetos parciais.)")
+    if args.aceitar_indeterminado and not plano.revisoes_de("indeterminado"):
+        print("(--aceitar-indeterminado informado, mas o plano não tem merges indeterminados.)")
+    if plano.dependencias or plano.bloqueios or plano.divergencias or plano.revisoes or plano.parciais \
+            or args.aceitar_atencao or args.aceitar_divergencia or args.aceitar_parcial or args.aceitar_indeterminado:
         print()
     estado = {
-        "versao": 1, "branch": args.branch, "branch_anterior": branch_atual() or head_sha(),
+        "versao": 2, "branch": args.branch, "branch_anterior": branch_atual() or head_sha(),
         "base_ref": analise.base_ref, "base_sha": analise.base_sha,
         "origem_ref": analise.origem_ref, "origem_sha": analise.origem_sha,
         "remoto": analise.remoto, "desde": analise.desde,
@@ -926,9 +1436,16 @@ def cmd_preparar(args, analise, avisos):
         "assinatura": plano.assinatura(), "alertas": plano.alertas,
         "autorizacoes": {"aceitar_bloqueios": bool(plano.bloqueios and args.aceitar_bloqueios),
                          "aceitar_atencao": bool(plano.dependencias and args.aceitar_atencao),
-                         "aceitar_divergencia": bool(plano.divergencias and args.aceitar_divergencia)},
+                         "aceitar_divergencia": bool((plano.divergencias or plano.revisoes_de("divergente"))
+                                                     and args.aceitar_divergencia),
+                         "aceitar_parcial": bool(plano.parciais and args.aceitar_parcial),
+                         "aceitar_indeterminado": bool(plano.revisoes_de("indeterminado") and args.aceitar_indeterminado)},
         "dependencias_aceitas": plano.dependencias if args.aceitar_atencao else [],
         "divergencias_aceitas": plano.divergencias if args.aceitar_divergencia else [],
+        "revisoes_aceitas": [r for r in plano.revisoes
+                             if (r["situacao"] == "divergente" and args.aceitar_divergencia)
+                             or (r["situacao"] == "indeterminado" and args.aceitar_indeterminado)],
+        "parciais_aceitos": plano.parciais if args.aceitar_parcial else [],
         "bloqueios_aceitos": plano.bloqueios if args.aceitar_bloqueios else [],
         "projetos_excluidos": plano.excluidos,
         "ignorados": [[s, m] for s, m in plano.ignorados],
@@ -947,6 +1464,11 @@ def cmd_continuar(args):
     if not branch:
         raise ErroUso("HEAD não está em uma branch. Volte para a branch de release.")
     estado = carregar_estado(branch)
+    validar_estado(estado, branch)
+    problemas = conferir_plano_do_estado(estado)
+    if problemas:
+        raise ErroUso("A release não pode ser retomada: %s. Nada foi feito. Rode `planejar` de novo e decida com o "
+                      "usuário (a branch parcial não é apagada)." % "; ".join(problemas))
     sha = estado.get("em_conflito")
     if not sha:
         if not estado["pendentes"]:
@@ -985,6 +1507,8 @@ def cmd_resumo(args):
     if not branch:
         raise ErroUso("Informe --branch.")
     estado = carregar_estado(branch)
+    validar_estado(estado, branch)
+    problemas_plano = conferir_plano_do_estado(estado)
     ponta = sha_de("refs/heads/" + branch)
     a = Analise(estado["base_ref"], estado["base_sha"], estado["origem_ref"], estado["origem_sha"],
                 estado["remoto"], estado.get("desde"))
@@ -1025,6 +1549,17 @@ def cmd_resumo(args):
         print("DIVERGÊNCIAS ACEITAS (--aceitar-divergencia; commits não reaplicados):")
         for d in estado["divergencias_aceitas"]:
             print("  - %s [%s] base tem %s com conteúdo diferente" % (curto(d["commit"]), d["projeto"], curto(d["base"])))
+    for situacao, flag in (("divergente", "--aceitar-divergencia"), ("indeterminado", "--aceitar-indeterminado")):
+        itens = [r for r in estado.get("revisoes_aceitas", []) if r["situacao"] == situacao]
+        if itens:
+            print("MERGES %sS ACEITOS (%s; commits não reaplicados):" % (situacao.upper(), flag))
+            for r in itens:
+                print("  - [%s] merge %s: %d commit(s)%s" % (r["projeto"], curto(r["merge"]), len(r["commits"]),
+                                                            "; base tem %s" % curto(r["base"]) if r["base"] else ""))
+    if estado.get("parciais_aceitos"):
+        print("PARCIAIS ACEITOS (--aceitar-parcial; só o restante aplicado):")
+        for p in estado["parciais_aceitos"]:
+            print("  - %s: %d já em produção, %d aplicado(s)" % (p["projeto"], p["em_producao"], p["aplicados"]))
 
     # verificação: commits fora do plano
     esperados = set(i["original"] for i in estado["aplicados"])
@@ -1038,6 +1573,7 @@ def cmd_resumo(args):
     selecionados = set(estado["projetos"])
     # divergências aceitas: o commit ficou de fora de propósito, então seus arquivos podem diferir da origem
     aceitas = set(d["commit"] for d in estado.get("divergencias_aceitas", []))
+    aceitas.update(c for r in estado.get("revisoes_aceitas", []) for c in r["commits"])
     nao_incluidos = [s for s, c in a.commits.items() if not c.merge and s not in a.promovidos
                      and (a.dono.get(s) not in selecionados or s in aceitas)
                      and s not in esperados and s not in estado["vazios"]]
@@ -1063,6 +1599,7 @@ def cmd_resumo(args):
                 divergentes.append(f)
     print()
     print("VERIFICAÇÕES")
+    print("  Plano confirmado × regras atuais: %s" % ("; ".join(problemas_plano) if problemas_plano else "compatível"))
     print("  Commits fora do plano na release: %s" % (", ".join(curto(s) for s in inesperados) or "nenhum"))
     print("  Arquivos alterados pela release: %d" % len(arquivos_release))
     print("  Divergências inesperadas em relação à origem: %s" % (", ".join(divergentes) or "nenhuma"))
@@ -1078,7 +1615,7 @@ def cmd_resumo(args):
     print("  git push -u %s %s   # e abrir MR/PR de %s para %s" % (estado["remoto"], branch, branch,
                                                                   estado["base_ref"].split("/")[-1]))
     print("Para voltar à branch anterior: git switch %s" % estado["branch_anterior"])
-    return 1 if (incompleta or inesperados or divergentes) else 0
+    return 1 if (incompleta or inesperados or divergentes or problemas_plano) else 0
 
 
 # --------------------------------------------------------------------------- main
@@ -1103,6 +1640,8 @@ def main(argv):
             sp.add_argument("--aceitar-bloqueios", action="store_true")
             sp.add_argument("--aceitar-atencao", action="store_true")
             sp.add_argument("--aceitar-divergencia", action="store_true")
+            sp.add_argument("--aceitar-parcial", action="store_true")
+            sp.add_argument("--aceitar-indeterminado", action="store_true")
     sub.add_parser("continuar")
     sp = sub.add_parser("resumo")
     sp.add_argument("--branch")
